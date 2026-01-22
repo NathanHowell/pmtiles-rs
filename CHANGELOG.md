@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2](https://github.com/stadiamaps/pmtiles-rs/compare/v0.19.1...v0.19.2) - 2026-01-22
+
+### Other
+
+- *(deps)* update countio requirement from 0.2.19 to 0.3.0 in the all-cargo-version-updates group ([#104](https://github.com/stadiamaps/pmtiles-rs/pull/104))
+- [pre-commit.ci] pre-commit autoupdate ([#102](https://github.com/stadiamaps/pmtiles-rs/pull/102))
+
 ## [0.19.1](https://github.com/stadiamaps/pmtiles-rs/compare/v0.19.0...v0.19.1) - 2026-01-13
 
 ### Other
