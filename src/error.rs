@@ -47,7 +47,7 @@ pub enum PmtError {
     #[cfg(feature = "mmap-async-tokio")]
     /// Failed to open the file for memory mapping.
     #[error("Unable to open mmap file")]
-    UnableToOpenMmapFile,
+    UnableToOpenMmapFile(#[source] std::io::Error),
     /// Unexpected number of bytes returned during reading.
     #[error("Unexpected number of bytes returned [expected: {0}, received: {1}].")]
     UnexpectedNumberOfBytesReturned(usize, usize),

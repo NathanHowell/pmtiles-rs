@@ -55,7 +55,7 @@ impl MmapBackend {
         Ok(Self {
             file: AsyncMmapFile::open_with_options(p, AsyncOptions::new().read(true))
                 .await
-                .map_err(|_| PmtError::UnableToOpenMmapFile)?,
+                .map_err(|e| PmtError::UnableToOpenMmapFile(io::Error::other(e)))?,
         })
     }
 }
