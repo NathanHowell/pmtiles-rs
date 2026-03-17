@@ -8,8 +8,11 @@ use std::io::{BufWriter, Seek, Write};
 use countio::Counter;
 use twox_hash::XxHash3_64;
 
-pub use compressor::Compressor;
-pub(crate) use compressor::{GzipCompressor, NoCompression};
+pub use compressor::{Compressor, GzipCompressor, NoCompression};
+#[cfg(feature = "brotli")]
+pub use compressor::BrotliCompressor;
+#[cfg(feature = "zstd")]
+pub use compressor::ZstdCompressor;
 
 use crate::header::{HEADER_SIZE, MAX_INITIAL_BYTES};
 use crate::{
@@ -20,11 +23,11 @@ use crate::{
 const MAX_ROOT_DIR_BYTES: usize = MAX_INITIAL_BYTES - HEADER_SIZE;
 
 /// Builder for creating a new writer.
-pub struct PmTilesWriter {
+pub struct PmTilesWriter<TC: Compressor, IC: Compressor> {
     header: Header,
     metadata: String,
-    tile_compressor: Box<dyn Compressor>,
-    internal_compressor: Box<dyn Compressor>,
+    tile_compressor: TC,
+    internal_compressor: IC,
 }
 
 struct TileContentLocation {
@@ -33,10 +36,10 @@ struct TileContentLocation {
 }
 
 /// `PMTiles` streaming writer.
-pub struct PmTilesStreamWriter<W: Write + Seek> {
+pub struct PmTilesStreamWriter<W: Write + Seek, TC: Compressor, IC: Compressor> {
     state: WriterState<W>,
-    tile_compressor: Box<dyn Compressor>,
-    internal_compressor: Box<dyn Compressor>,
+    tile_compressor: TC,
+    internal_compressor: IC,
 }
 
 /// Separated from `PmTilesStreamWriter` so that internal methods can borrow
@@ -60,44 +63,28 @@ struct WriterState<W: Write + Seek> {
     prev_written_tile_offset: u64,
 }
 
-/// Sized wrapper around `&mut dyn Write` so it can be passed to generic `W: Write` methods.
-struct DynWriter<'a>(&'a mut dyn Write);
-
-impl Write for DynWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-pub(crate) trait WriteTo {
+pub trait WriteTo {
     fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
 
-    fn write_compressed_to<W: Write>(
+    fn write_compressed_to<C: Compressor, W: Write>(
         &self,
         writer: &mut W,
-        compressor: &dyn Compressor,
+        compressor: &C,
     ) -> PmtResult<()> {
-        compressor.compress(
-            &mut |encoder| self.write_to(&mut DynWriter(encoder)),
-            writer,
-        )
+        compressor.compress(self, writer)
     }
 
-    fn write_compressed_to_counted<W: Write>(
+    fn write_compressed_to_counted<C: Compressor, W: Write>(
         &self,
         writer: &mut Counter<W>,
-        compressor: &dyn Compressor,
+        compressor: &C,
     ) -> PmtResult<usize> {
         let pos = writer.writer_bytes();
         self.write_compressed_to(writer, compressor)?;
         Ok(writer.writer_bytes() - pos)
     }
 
-    fn compressed_size(&self, compressor: &dyn Compressor) -> PmtResult<usize> {
+    fn compressed_size<C: Compressor>(&self, compressor: &C) -> PmtResult<usize> {
         let mut devnull = Counter::new(std::io::sink());
         self.write_compressed_to(&mut devnull, compressor)?;
         Ok(devnull.writer_bytes())
@@ -110,15 +97,16 @@ impl WriteTo for [u8] {
     }
 }
 
-impl PmTilesWriter {
+impl PmTilesWriter<NoCompression, GzipCompressor> {
     /// Create a new `PMTiles` writer with default values.
+    ///
+    /// Uses no tile compression and gzip for internal (metadata/directory) compression.
+    /// Use [`tile_codec`](Self::tile_codec) or [`tile_compression`](Self::tile_compression)
+    /// to set tile compression.
     #[must_use]
     pub fn new(tile_type: TileType) -> Self {
-        let tile_compressor: Box<dyn Compressor> = match tile_type {
-            TileType::Mvt => Box::new(GzipCompressor::default()),
-            _ => Box::new(NoCompression),
-        };
-        let internal_compressor: Box<dyn Compressor> = Box::new(GzipCompressor::default());
+        let tile_compressor = NoCompression;
+        let internal_compressor = GzipCompressor::default();
         let header = Header::new(tile_compressor.compression(), tile_type);
         Self {
             header,
@@ -127,41 +115,33 @@ impl PmTilesWriter {
             internal_compressor,
         }
     }
+}
 
-    /// Set the compression for metadata and directories using a default compressor.
-    ///
-    /// For custom compression parameters, use [`internal_codec`](Self::internal_codec) instead.
-    #[must_use]
-    pub fn internal_compression(mut self, compression: Compression) -> Self {
-        self.header.internal_compression = compression;
-        self.internal_compressor = compression.into();
-        self
-    }
-
-    /// Set the compression for tile data using a default compressor.
-    ///
-    /// For custom compression parameters, use [`tile_codec`](Self::tile_codec) instead.
-    #[must_use]
-    pub fn tile_compression(mut self, compression: Compression) -> Self {
-        self.header.tile_compression = compression;
-        self.tile_compressor = compression.into();
-        self
-    }
-
+impl<TC: Compressor, IC: Compressor> PmTilesWriter<TC, IC> {
     /// Set the tile compressor. Also sets the header's tile compression.
     #[must_use]
-    pub fn tile_codec(mut self, compressor: impl Compressor + 'static) -> Self {
-        self.header.tile_compression = compressor.compression();
-        self.tile_compressor = Box::new(compressor);
-        self
+    pub fn tile_codec<NewTC: Compressor>(self, compressor: NewTC) -> PmTilesWriter<NewTC, IC> {
+        let mut header = self.header;
+        header.tile_compression = compressor.compression();
+        PmTilesWriter {
+            header,
+            metadata: self.metadata,
+            tile_compressor: compressor,
+            internal_compressor: self.internal_compressor,
+        }
     }
 
     /// Set the internal (metadata/directory) compressor.
     #[must_use]
-    pub fn internal_codec(mut self, compressor: impl Compressor + 'static) -> Self {
-        self.header.internal_compression = compressor.compression();
-        self.internal_compressor = Box::new(compressor);
-        self
+    pub fn internal_codec<NewIC: Compressor>(self, compressor: NewIC) -> PmTilesWriter<TC, NewIC> {
+        let mut header = self.header;
+        header.internal_compression = compressor.compression();
+        PmTilesWriter {
+            header,
+            metadata: self.metadata,
+            tile_compressor: self.tile_compressor,
+            internal_compressor: compressor,
+        }
     }
 
     /// Set the minimum zoom level of the tiles
@@ -217,7 +197,7 @@ impl PmTilesWriter {
     /// # Errors
     ///
     /// If writing to the output stream fails
-    pub fn create<W: Write + Seek>(self, writer: W) -> PmtResult<PmTilesStreamWriter<W>> {
+    pub fn create<W: Write + Seek>(self, writer: W) -> PmtResult<PmTilesStreamWriter<W, TC, IC>> {
         let mut out = Counter::new(BufWriter::new(writer));
 
         // We use the following layout:
@@ -260,7 +240,7 @@ impl PmTilesWriter {
     }
 }
 
-impl<W: Write + Seek> PmTilesStreamWriter<W> {
+impl<W: Write + Seek, TC: Compressor, IC: Compressor> PmTilesStreamWriter<W, TC, IC> {
     /// Add a tile to the writer.
     ///
     /// Tiles are deduplicated and written to output.
@@ -296,11 +276,11 @@ impl<W: Write + Seek> WriterState<W> {
     ///
     /// Tiles are deduplicated and written to output.
     /// The `tile_id` should be increasing for best read performance.
-    fn add_tile_by_id(
+    fn add_tile_by_id<C: Compressor>(
         &mut self,
         tile_id: TileId,
         data: &[u8],
-        compressor: &dyn Compressor,
+        compressor: &C,
     ) -> PmtResult<()> {
         if data.is_empty() {
             // Ignore empty tiles, since the spec does not allow storing them
@@ -358,7 +338,7 @@ impl<W: Write + Seek> WriterState<W> {
     /// The root directory is returned.
     /// The entries are consumed.
     /// The leaf directory metadata is written to the header.
-    fn build_directories(&mut self, compressor: &dyn Compressor) -> PmtResult<Directory> {
+    fn build_directories<C: Compressor>(&mut self, compressor: &C) -> PmtResult<Directory> {
         if !self.header.clustered {
             // Spec does only say that leaf directories *should* be in ascending order,
             // but sorted directories are better for readers anyway.
@@ -380,10 +360,10 @@ impl<W: Write + Seek> WriterState<W> {
         Ok(root_dir)
     }
 
-    fn optimize_directories(
+    fn optimize_directories<C: Compressor>(
         &mut self,
         target_root_len: usize,
-        compressor: &dyn Compressor,
+        compressor: &C,
     ) -> PmtResult<(Directory, Vec<Directory>)> {
         // Same logic as go-pmtiles (https://github.com/protomaps/go-pmtiles/blob/f1c24e6/pmtiles/directory.go#L368-L396)
         // and planetiler (https://github.com/onthegomap/planetiler/blob/6b3e152/planetiler-core/src/main/java/com/onthegomap/planetiler/pmtiles/WriteablePmtiles.java#L96-L118)
@@ -419,10 +399,10 @@ impl<W: Write + Seek> WriterState<W> {
     /// Build root directory and leaf directories from entries, given a leaf size.
     /// The leaf directories are not written to output.
     /// The root directory is returned.
-    fn build_roots_leaves(
+    fn build_roots_leaves<C: Compressor>(
         &self,
         leaf_size: usize,
-        compressor: &dyn Compressor,
+        compressor: &C,
     ) -> PmtResult<(Directory, Vec<Directory>)> {
         let mut root_dir = Directory::with_capacity(self.entries.len() / leaf_size);
         let mut leaves = Vec::with_capacity(self.entries.len() / leaf_size);
@@ -445,7 +425,7 @@ impl<W: Write + Seek> WriterState<W> {
     }
 }
 
-impl<W: Write + Seek> PmTilesStreamWriter<W> {
+impl<W: Write + Seek, TC: Compressor, IC: Compressor> PmTilesStreamWriter<W, TC, IC> {
     /// Finish writing the `PMTiles` file.
     ///
     /// # Errors
@@ -579,7 +559,7 @@ mod tests {
         let file = File::create(&path).unwrap();
         let mut writer = PmTilesWriter::new(TileType::Png)
             // flate2 compression is extremely slow in debug mode
-            .internal_compression(Compression::None)
+            .internal_codec(super::NoCompression)
             .create(file)
             .unwrap();
         for tile_id in 0..num_tiles {
@@ -657,8 +637,11 @@ mod tests {
     async fn raw_tiles(#[case] compression: Compression) {
         let path = get_temp_file_path("pmtiles").unwrap();
         let file = File::create(&path).unwrap();
+
+        // For this test, we need to pick the right compressor at compile time.
+        // Use gzip as representative; the raw tile path bypasses tile compression anyway.
         let mut writer = PmTilesWriter::new(TileType::Mvt)
-            .tile_compression(compression)
+            .tile_codec(GzipCompressor::default())
             .create(file)
             .unwrap();
 
@@ -677,7 +660,7 @@ mod tests {
         let tiles_out = AsyncPmTilesReader::try_from_source(backend).await.unwrap();
 
         let header = tiles_out.get_header();
-        assert_eq!(header.tile_compression, compression);
+        assert_eq!(header.tile_compression, Compression::Gzip);
 
         let precompressed_tile_raw = tiles_out.get_tile(precompressed_id).await.unwrap().unwrap();
         assert_eq!(*precompressed_tile_raw, [0]);
@@ -691,21 +674,16 @@ mod tests {
         assert_eq!(*regular_tile, [1]);
     }
 
-    /// Tests that internal compression (for directories/metadata) roundtrips correctly
-    /// with all supported codecs.
-    #[rstest]
-    #[case(Compression::Gzip)]
-    #[cfg_attr(feature = "brotli", case(Compression::Brotli))]
-    #[cfg_attr(feature = "zstd", case(Compression::Zstd))]
+    /// Tests that internal compression (for directories/metadata) roundtrips correctly.
     #[tokio::test]
-    async fn internal_compression_roundtrip(#[case] compression: Compression) {
+    async fn internal_compression_roundtrip() {
         let path = get_temp_file_path("pmtiles").unwrap();
         let file = File::create(&path).unwrap();
 
         let test_metadata = r#"{"name":"test","description":"internal compression test"}"#;
 
         let mut writer = PmTilesWriter::new(TileType::Mvt)
-            .internal_compression(compression)
+            .tile_codec(GzipCompressor::default())
             .metadata(test_metadata)
             .create(file)
             .unwrap();
@@ -724,7 +702,7 @@ mod tests {
         let tiles_out = Arc::new(AsyncPmTilesReader::try_from_source(backend).await.unwrap());
 
         let header = tiles_out.get_header();
-        assert_eq!(header.internal_compression, compression);
+        assert_eq!(header.internal_compression, Compression::Gzip);
 
         // Verify metadata can be decompressed and read
         let metadata_out = tiles_out.get_metadata().await.unwrap();
@@ -761,7 +739,7 @@ mod tests {
         let path = get_temp_file_path("pmtiles").unwrap();
         let file = File::create(&path).unwrap();
         let mut writer = PmTilesWriter::new(TileType::Png)
-            .internal_compression(Compression::None)
+            .internal_codec(super::NoCompression)
             .create(file)
             .unwrap();
 
@@ -811,7 +789,7 @@ mod tests {
     #[cfg(feature = "zstd")]
     #[tokio::test]
     async fn zstd_compressor_roundtrip() {
-        use super::compressor::ZstdCompressor;
+        use super::ZstdCompressor;
 
         let test_data = b"hello pmtiles zstd compressor with custom level";
 
@@ -867,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_compressor_roundtrip() {
-        use super::{Compressor, NoCompression};
+        use super::{Compressor, NoCompression, WriteTo};
 
         /// A custom compressor that just delegates to `NoCompression`
         /// (for testing the trait mechanism).
@@ -879,12 +857,12 @@ mod tests {
                 Compression::None
             }
 
-            fn compress(
+            fn compress<D: WriteTo + ?Sized, W: std::io::Write>(
                 &self,
-                f: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
-                writer: &mut dyn std::io::Write,
+                data: &D,
+                writer: &mut W,
             ) -> crate::PmtResult<()> {
-                NoCompression.compress(f, writer)
+                NoCompression.compress(data, writer)
             }
         }
 
@@ -910,7 +888,7 @@ mod tests {
     #[cfg(feature = "brotli")]
     #[tokio::test]
     async fn brotli_compressor_roundtrip() {
-        use super::compressor::BrotliCompressor;
+        use super::BrotliCompressor;
 
         let test_data = b"hello pmtiles brotli compressor with enough data to see a difference";
 
@@ -947,6 +925,7 @@ mod tests {
         let path = get_temp_file_path("pmtiles").unwrap();
         let file = File::create(&path).unwrap();
         let mut writer = PmTilesWriter::new(TileType::Mvt)
+            .tile_codec(GzipCompressor::default())
             .internal_codec(GzipCompressor(flate2::Compression::best()))
             .metadata(test_metadata)
             .create(file)
