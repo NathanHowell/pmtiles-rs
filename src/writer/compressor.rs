@@ -2,6 +2,7 @@ use std::io::Write;
 
 use flate2::write::GzEncoder;
 
+use super::WriteTo;
 use crate::{Compression, PmtError, PmtResult};
 
 /// Trait for compression implementations.
@@ -10,67 +11,52 @@ pub trait Compressor {
     /// Returns the compression type for the `PMTiles` header.
     fn compression(&self) -> Compression;
 
-    /// Invoke `f` to write uncompressed data into an encoder
-    /// wrapping `writer`, then finalize the encoder.
+    /// Compress `data` through an encoder wrapping `writer`, then finalize.
     ///
     /// # Errors
     ///
-    /// Returns an error if writing to `output` fails or the compression fails.
-    fn compress(
+    /// Returns an error if writing to `writer` fails or the compression fails.
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
+        data: &D,
+        writer: &mut W,
     ) -> PmtResult<()>;
 }
 
-impl<T: Compressor + ?Sized> Compressor for Box<T> {
-    fn compression(&self) -> Compression {
-        (**self).compression()
-    }
-
-    fn compress(
-        &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
-    ) -> PmtResult<()> {
-        (**self).compress(f, writer)
-    }
-}
-
 /// Passthrough (no compression).
-pub(crate) struct NoCompression;
+pub struct NoCompression;
 
 impl Compressor for NoCompression {
     fn compression(&self) -> Compression {
         Compression::None
     }
 
-    fn compress(
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
+        data: &D,
+        writer: &mut W,
     ) -> PmtResult<()> {
-        f(writer)?;
+        data.write_to(writer)?;
         Ok(())
     }
 }
 
 /// Gzip compression. Wraps [`flate2::Compression`] for level configuration.
 #[derive(Default)]
-pub(crate) struct GzipCompressor(pub(crate) flate2::Compression);
+pub struct GzipCompressor(pub flate2::Compression);
 
 impl Compressor for GzipCompressor {
     fn compression(&self) -> Compression {
         Compression::Gzip
     }
 
-    fn compress(
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
+        data: &D,
+        writer: &mut W,
     ) -> PmtResult<()> {
         let mut encoder = GzEncoder::new(writer, self.0);
-        f(&mut encoder)?;
+        data.write_to(&mut encoder)?;
         encoder.finish()?;
         Ok(())
     }
@@ -79,7 +65,7 @@ impl Compressor for GzipCompressor {
 /// Brotli compression. Wraps [`brotli::enc::BrotliEncoderParams`].
 #[cfg(feature = "brotli")]
 #[derive(Default)]
-pub(crate) struct BrotliCompressor(pub(crate) brotli::enc::BrotliEncoderParams);
+pub struct BrotliCompressor(pub brotli::enc::BrotliEncoderParams);
 
 #[cfg(feature = "brotli")]
 impl Compressor for BrotliCompressor {
@@ -87,20 +73,20 @@ impl Compressor for BrotliCompressor {
         Compression::Brotli
     }
 
-    fn compress(
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
+        data: &D,
+        writer: &mut W,
     ) -> PmtResult<()> {
         let mut encoder = brotli::CompressorWriter::with_params(writer, 4096, &self.0);
-        f(&mut encoder)?;
+        data.write_to(&mut encoder)?;
         Ok(())
     }
 }
 
 /// Zstd compression with configurable level.
 #[cfg(feature = "zstd")]
-pub(crate) struct ZstdCompressor(pub(crate) i32);
+pub struct ZstdCompressor(pub i32);
 
 #[cfg(feature = "zstd")]
 impl Compressor for ZstdCompressor {
@@ -108,13 +94,13 @@ impl Compressor for ZstdCompressor {
         Compression::Zstd
     }
 
-    fn compress(
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        writer: &mut dyn Write,
+        data: &D,
+        writer: &mut W,
     ) -> PmtResult<()> {
         let mut encoder = zstd::stream::Encoder::new(writer, self.0)?;
-        f(&mut encoder)?;
+        data.write_to(&mut encoder)?;
         encoder.finish()?;
         Ok(())
     }
@@ -127,33 +113,19 @@ impl Default for ZstdCompressor {
     }
 }
 
-impl From<Compression> for Box<dyn Compressor> {
-    fn from(compression: Compression) -> Self {
-        match compression {
-            Compression::None => Box::new(NoCompression),
-            Compression::Gzip => Box::new(GzipCompressor::default()),
-            #[cfg(feature = "brotli")]
-            Compression::Brotli => Box::new(BrotliCompressor::default()),
-            #[cfg(feature = "zstd")]
-            Compression::Zstd => Box::new(ZstdCompressor::default()),
-            v => Box::new(UnsupportedCompressor(v)),
-        }
-    }
-}
-
 /// Stub compressor for codecs whose feature is disabled.
 /// Returns an error when compression is attempted.
-struct UnsupportedCompressor(Compression);
+pub struct UnsupportedCompressor(pub(crate) Compression);
 
 impl Compressor for UnsupportedCompressor {
     fn compression(&self) -> Compression {
         self.0
     }
 
-    fn compress(
+    fn compress<D: WriteTo + ?Sized, W: Write>(
         &self,
-        _f: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
-        _writer: &mut dyn Write,
+        _data: &D,
+        _writer: &mut W,
     ) -> PmtResult<()> {
         Err(PmtError::UnsupportedCompression(self.0))
     }
