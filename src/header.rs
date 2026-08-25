@@ -119,6 +119,22 @@ impl Header {
     pub fn internal_compression(&self) -> Compression {
         self.internal_compression
     }
+
+    /// Byte offset, from the start of the archive, of the tile-data section.
+    ///
+    /// `DirEntry::offset` is relative to this, so absolute positions are
+    /// `data_offset() + entry.offset()`.
+    #[must_use]
+    pub fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    /// Total byte length of the tile-data section — the archive's true
+    /// stored tile size, after deduplication.
+    #[must_use]
+    pub fn data_length(&self) -> u64 {
+        self.data_length
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
@@ -391,6 +407,27 @@ mod tests {
         assert_eq!(header.min_longitude, -180.0);
         assert_eq!(header.max_longitude, 180.0);
         assert!(header.clustered);
+    }
+
+    /// The tile-data extents are the one part of the header a size-profiling
+    /// consumer reads, and `data_offset`/`data_length` are adjacent fields of
+    /// the same width — exactly the pair a typo would swap. Pin them against
+    /// the fixture, and against the directory entry `directory.rs` already
+    /// pins, so a swap fails here rather than silently mis-sizing an archive.
+    #[test]
+    fn read_tile_data_extents() {
+        let mut test = File::open(RASTER_FILE).unwrap();
+        let mut header_bytes = [0; HEADER_SIZE];
+        test.read_exact(header_bytes.as_mut_slice()).unwrap();
+
+        let header = Header::try_from_bytes(Bytes::copy_from_slice(&header_bytes)).unwrap();
+
+        assert_eq!(header.data_offset(), header.data_offset);
+        assert_eq!(header.data_length(), header.data_length);
+        // Entry 58 of the root directory sits at offset 422_070 with length
+        // 850 (see `directory::tests::root_directory`); entry offsets are
+        // relative to the data section, so the section must contain it.
+        assert!(header.data_length() >= 422_070 + 850);
     }
 
     #[test]
