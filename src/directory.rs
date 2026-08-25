@@ -165,6 +165,30 @@ impl DirEntry {
         self.run_length == 0
     }
 
+    /// Byte offset of this entry's tile data, relative to the archive's
+    /// data section (`Header::data_offset`).
+    ///
+    /// Distinct entries may report the same offset: `PMTiles` deduplicates
+    /// byte-identical tiles by pointing several entries at one stored blob,
+    /// so `(offset, length)` — not the entry itself — identifies a blob.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Stored (still-compressed) length in bytes of this entry's tile data.
+    #[must_use]
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// Number of consecutive tile ids this entry addresses, all sharing the
+    /// one stored blob. Zero marks a leaf-directory entry rather than a tile.
+    #[must_use]
+    pub fn run_length(&self) -> u32 {
+        self.run_length
+    }
+
     #[cfg(feature = "iter-async")]
     #[must_use]
     /// Returns an iterator over the tile coordinates covered by this entry.
@@ -257,6 +281,18 @@ mod tests {
             directory.entries[58].iter_coords().collect::<Vec<_>>(),
             vec![coord(3, 4, 7).into(), coord(3, 5, 7).into()]
         );
+    }
+
+    /// The accessors are the only view an external consumer gets of an
+    /// entry's stored extent, so pin them against the same fixture values
+    /// `root_directory` checks through the private fields.
+    #[test]
+    fn entry_accessors_report_the_parsed_extent() {
+        let directory = read_root_directory(RASTER_FILE);
+        let entry = &directory.entries[58];
+        assert_eq!(entry.offset(), 422_070);
+        assert_eq!(entry.length(), 850);
+        assert_eq!(entry.run_length(), 2);
     }
 
     #[test]
